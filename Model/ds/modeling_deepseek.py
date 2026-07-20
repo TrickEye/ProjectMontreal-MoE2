@@ -305,10 +305,28 @@ class MoEGate(nn.Module):
         self.variance_loss_weight = -1
         self.ortho_loss_target = getattr(config, 'ortho_loss_weight', 0.0001)
         self.ortho_loss_weight = -1
+
+        # ============ Selective Specialization Loss (Token-level gating) ============
+        # If enabled, only the top-p% tokens (ranked by a "specialization need" signal)
+        # receive L_o and L_v pressure, reducing compute and avoiding negative transfer
+        # on generic tokens that shouldn't be forced into expert-specific representations.
+        self.use_selective = getattr(config, 'use_selective_loss', False)
+        self.selective_ratio = getattr(config, 'selective_ratio', 0.3)      # top 30% tokens
+        self.selective_signal = getattr(config, 'selective_signal', 'entropy')  # 'entropy' | 'overlap' | 'combined'
+        # Stores token weights from gate forward for use in ortho_loss computation.
+        # Detached to avoid circular gradient: selection is based on current router state
+        # but gradients don't flow through the selection mask back to router weights.
+        # For stronger protection against circularity, a lagged version (previous-step
+        # signal → current-step mask) can be added by maintaining a buffer.
+        self._current_token_weights = None
+
         print("------------------variance_loss_target------------------")
         print(self.variance_loss_target)
         print("------------------ortho_loss_target------------------")
         print(self.ortho_loss_target)
+        if self.use_selective:
+            print("------------------selective_loss------------------")
+            print(f"  enabled: True, ratio={self.selective_ratio}, signal={self.selective_signal}")
 
         # tensorboard logging
         self.layer_idx = idx
@@ -329,19 +347,29 @@ class MoEGate(nn.Module):
         import torch.nn.init as init
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
     
-    def compute_ortho_loss(self, expert_outputs):
+    def compute_ortho_loss(self, expert_outputs, token_weights=None):
         """
-        Compute orthogonality loss for expert outputs
+        Compute orthogonality loss for expert outputs with optional token-level weighting.
+
+        When token_weights is provided (selective mode), only high-need tokens contribute
+        to the orthogonality loss, reducing wasted computation on generic/punctuation tokens
+        and avoiding negative transfer on tokens that should be shared across experts.
+
         Args:
             expert_outputs: [batch*seq_len, top_k, hidden_dim]
+            token_weights:  [batch*seq_len] optional binary/continuous weights.
+                           If None, uniform weighting (original behavior).
         Returns:
             ortho_loss: scalar tensor
         """
-        total_loss = 0.0
+        n_tokens = expert_outputs.size(0)
+        # Accumulate per-token projection loss instead of a global scalar
+        per_token_loss = torch.zeros(n_tokens, device=expert_outputs.device, dtype=expert_outputs.dtype)
+
         for i in range(self.top_k):
             # Select all experts except the i-th one
             other_experts = torch.cat([expert_outputs[:, :i], expert_outputs[:, i+1:]], dim=1)
-            
+
             # Compute orthogonal basis for other experts (Gram-Schmidt)
             u = []  # will store orthogonal basis
             for j in range(other_experts.size(1)):
@@ -352,17 +380,23 @@ class MoEGate(nn.Module):
                 v_norm = torch.norm(v, dim=-1, keepdim=True)
                 v = v / (v_norm + 1e-6)
                 u.append(v)
-            
+
             # Compute projection of current expert on this basis
             current_expert = expert_outputs[:, i]
-            proj_loss = 0.0
             for u_vec in u:
                 proj = (u_vec * current_expert).sum(dim=-1, keepdim=True) * u_vec
-                proj_loss = proj_loss + torch.sum(proj**2)
-            
-            total_loss = total_loss + proj_loss
-        
-        return total_loss / (self.top_k * expert_outputs.size(0))
+                # Sum over hidden_dim only → [n_tokens], preserving per-token granularity
+                per_token_loss = per_token_loss + torch.sum(proj**2, dim=-1)
+
+        if token_weights is not None:
+            # Selective mode: weighted average over selected tokens only
+            weighted_sum = (per_token_loss * token_weights).sum()
+            norm = token_weights.sum() + 1e-8
+            return weighted_sum / (norm * self.top_k)
+        else:
+            # Uniform mode (original behavior): equally weighted average
+            # per_token_loss.mean() / top_k == total_loss / (top_k * n_tokens)
+            return per_token_loss.mean() / self.top_k
     
     def compute_weight(self, hidden_states):
         """
@@ -421,17 +455,53 @@ class MoEGate(nn.Module):
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
-        
+
         # Variance loss (before topk)
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
+
+            # ============ Token-level selection for selective specialization ============
+            # Compute a per-token "specialization need" signal and select the top-p% tokens
+            # to receive L_o / L_v pressure. This avoids wasting compute and gradient on
+            # generic tokens (punctuation, stop words) that shouldn't be forced into
+            # expert-specific representations.
+            if self.use_selective and self.training:
+                with torch.no_grad():  # stop-gradient: selection shouldn't backprop through router
+                    if self.selective_signal == 'entropy':
+                        # S1: Routing entropy — high entropy = router is uncertain = needs push
+                        # Reuses the softmax scores already computed; zero extra cost.
+                        signal = -(scores * torch.log(scores + 1e-8)).sum(dim=-1)  # [bsz*seq_len]
+                    elif self.selective_signal == 'overlap':
+                        # S2 placeholder: will be filled with expert-output-overlap signal
+                        # from the previous step (lagged to avoid circularity with L_o).
+                        # For now, fall back to entropy.
+                        signal = -(scores * torch.log(scores + 1e-8)).sum(dim=-1)
+                    else:
+                        signal = -(scores * torch.log(scores + 1e-8)).sum(dim=-1)
+
+                    n_tokens = signal.shape[0]
+                    k = max(1, int(n_tokens * self.selective_ratio))
+                    _, top_indices = torch.topk(signal, k)
+                    token_weights = torch.zeros(n_tokens, device=scores.device, dtype=scores.dtype)
+                    token_weights[top_indices] = 1.0
+                    self._current_token_weights = token_weights  # stored for ortho_loss in MoE layer
+            else:
+                self._current_token_weights = None
+
             # 获取当前设备
             device = scores.device
             # 确保所有张量都在同一设备上
             if self.variance_loss_weight==0:
                 variance_loss = torch.var(scores, dim=-1).mean() * self.variance_loss_weight
             else:
-                variance_loss = torch.var(scores, dim=-1).mean() * self.variance_loss_weight.to(device)
+                if self.use_selective and self.training and self._current_token_weights is not None:
+                    # Selective variance loss: only push router confidence on high-need tokens
+                    w = self._current_token_weights
+                    token_var = torch.var(scores, dim=-1)  # [bsz*seq_len]
+                    weighted_var = (token_var * w).sum() / (w.sum() + 1e-8)
+                    variance_loss = weighted_var * self.variance_loss_weight.to(device)
+                else:
+                    variance_loss = torch.var(scores, dim=-1).mean() * self.variance_loss_weight.to(device)
             
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
@@ -473,9 +543,12 @@ class MoEGate(nn.Module):
         # Log losses to TensorBoard
         if self.training and self.layer_idx == 1:
             step_cnt += 1
-        if step_cnt % logging_steps == 0 and self.training:    
+        if step_cnt % logging_steps == 0 and self.training:
             self.writer.add_scalar(f"Loss/aux_loss/MoElayer_{self.layer_idx}", aux_loss.item() , step_cnt)
             self.writer.add_scalar(f"Variance/MoElayer_{self.layer_idx}", variance_loss.item() * self.variance_loss_weight, step_cnt)
+            if self.use_selective and self._current_token_weights is not None:
+                selected_frac = self._current_token_weights.sum().item() / self._current_token_weights.numel()
+                self.writer.add_scalar(f"Selective/token_fraction/MoElayer_{self.layer_idx}", selected_frac, step_cnt)
             # self.writer.add_scalar(f"Loss/ortho_loss/MoElayer_{self.layer_idx}", ortho_loss.item(), step_cnt)
             # self.writer.add_scalar(f"Loss/total_loss/MoElayer_{self.layer_idx}", total_loss.item(), step_cnt)
         # MaxVloglobal
@@ -552,8 +625,12 @@ class DeepseekMoE(nn.Module):
                     y[mask] = expert_out
             if self.num_experts_per_tok > 1:
                 expert_outputs_reshaped = y.view(-1, self.num_experts_per_tok, y.size(-1))
-                
-                ortho_loss_value = self.gate.compute_ortho_loss(expert_outputs_reshaped)
+
+                # Retrieve token weights from gate for selective ortho loss.
+                # These are computed in gate.forward() from routing entropy (S1),
+                # detached to avoid circular gradient through the selection mask.
+                token_weights = getattr(self.gate, '_current_token_weights', None)
+                ortho_loss_value = self.gate.compute_ortho_loss(expert_outputs_reshaped, token_weights)
                 device = ortho_loss_value.device
                 
                 ortho_loss = ortho_loss_value * self.gate.ortho_loss_weight.to(device)
